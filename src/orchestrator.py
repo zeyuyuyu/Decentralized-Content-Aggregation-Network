@@ -1,34 +1,93 @@
-import asyncio
-import ipfs_client
-import blockchain_client
+import time
+from typing import List, Dict, Any
+from dataclasses import dataclass
+from enum import Enum
+import logging
 
-class Orchestrator:
+class CircuitState(Enum):
+    CLOSED = 'CLOSED'
+    OPEN = 'OPEN'
+    HALF_OPEN = 'HALF_OPEN'
+
+@dataclass
+class CircuitBreaker:
+    failure_threshold: int = 5
+    reset_timeout: int = 60
+    failure_count: int = 0
+    last_failure_time: float = 0
+    state: CircuitState = CircuitState.CLOSED
+
+class ContentOrchestrator:
     def __init__(self):
-        self.ipfs_client = ipfs_client.IPFSClient()
-        self.blockchain_client = blockchain_client.BlockchainClient()
+        self.nodes: Dict[str, CircuitBreaker] = {}
+        self.logger = logging.getLogger(__name__)
 
-    async def cache_and_distribute_content(self, content):
-        # Store content on IPFS
-        ipfs_hash = await self.ipfs_client.add_content(content)
+    def distribute_content(self, content: Dict[str, Any], target_nodes: List[str], retries: int = 3) -> bool:
+        """Distributes content to target nodes with retry logic and circuit breaker pattern"""
+        successful_distributions = 0
 
-        # Publish content hash to blockchain
-        await self.blockchain_client.publish_content_hash(ipfs_hash)
+        for node in target_nodes:
+            if node not in self.nodes:
+                self.nodes[node] = CircuitBreaker()
 
-        # Distribute content to nearby nodes
-        await self.distribute_content(ipfs_hash)
+            circuit = self.nodes[node]
+            
+            if self._is_circuit_open(circuit):
+                self.logger.warning(f'Circuit breaker open for node {node}, skipping distribution')
+                continue
 
-    async def distribute_content(self, ipfs_hash):
-        # Discover nearby nodes from blockchain
-        nearby_nodes = await self.blockchain_client.get_nearby_nodes(ipfs_hash)
+            for attempt in range(retries):
+                try:
+                    success = self._send_to_node(node, content)
+                    if success:
+                        successful_distributions += 1
+                        circuit.failure_count = 0
+                        break
+                except Exception as e:
+                    self.logger.error(f'Distribution attempt {attempt + 1} failed for node {node}: {str(e)}')
+                    self._handle_failure(circuit)
+                    if attempt == retries - 1:
+                        self.logger.error(f'All retries failed for node {node}')
 
-        # Transfer content to nearby nodes
-        await asyncio.gather(*[self.ipfs_client.transfer_content(ipfs_hash, node) for node in nearby_nodes])
+        return successful_distributions > 0
 
-    async def retrieve_content(self, content_id):
-        # Retrieve content hash from blockchain
-        ipfs_hash = await self.blockchain_client.get_content_hash(content_id)
+    def _is_circuit_open(self, circuit: CircuitBreaker) -> bool:
+        """Check if circuit breaker is open and handle state transitions"""
+        if circuit.state == CircuitState.OPEN:
+            if time.time() - circuit.last_failure_time >= circuit.reset_timeout:
+                circuit.state = CircuitState.HALF_OPEN
+                return False
+            return True
+        return False
 
-        # Fetch content from IPFS
-        content = await self.ipfs_client.retrieve_content(ipfs_hash)
+    def _handle_failure(self, circuit: CircuitBreaker):
+        """Handle node failure and update circuit breaker state"""
+        circuit.failure_count += 1
+        circuit.last_failure_time = time.time()
 
-        return content
+        if circuit.failure_count >= circuit.failure_threshold:
+            circuit.state = CircuitState.OPEN
+            self.logger.warning('Circuit breaker triggered - opening circuit')
+
+    def _send_to_node(self, node: str, content: Dict[str, Any]) -> bool:
+        """Send content to a specific node"""
+        # TODO: Implement actual node communication logic
+        # This is a placeholder that should be replaced with real node communication
+        return True
+
+    def get_node_health(self) -> Dict[str, Dict]:
+        """Get health status of all nodes"""
+        return {
+            node: {
+                'state': cb.state.value,
+                'failures': cb.failure_count,
+                'last_failure': cb.last_failure_time
+            } for node, cb in self.nodes.items()
+        }
+
+    def reset_circuit(self, node: str) -> bool:
+        """Manually reset circuit breaker for a node"""
+        if node in self.nodes:
+            self.nodes[node] = CircuitBreaker()
+            return True
+        return False
