@@ -1,93 +1,88 @@
+import asyncio
+from typing import Dict, Set, Optional
 import time
-from typing import List, Dict, Any
-from dataclasses import dataclass
-from enum import Enum
 import logging
 
-class CircuitState(Enum):
-    CLOSED = 'CLOSED'
-    OPEN = 'OPEN'
-    HALF_OPEN = 'HALF_OPEN'
-
-@dataclass
-class CircuitBreaker:
-    failure_threshold: int = 5
-    reset_timeout: int = 60
-    failure_count: int = 0
-    last_failure_time: float = 0
-    state: CircuitState = CircuitState.CLOSED
-
-class ContentOrchestrator:
+class NetworkOrchestrator:
     def __init__(self):
-        self.nodes: Dict[str, CircuitBreaker] = {}
-        self.logger = logging.getLogger(__name__)
+        self.nodes: Dict[str, dict] = {}
+        self.active_nodes: Set[str] = set()
+        self.last_heartbeat: Dict[str, float] = {}
+        self.heartbeat_interval = 30  # seconds
+        self.node_timeout = 90  # seconds
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger('NetworkOrchestrator')
 
-    def distribute_content(self, content: Dict[str, Any], target_nodes: List[str], retries: int = 3) -> bool:
-        """Distributes content to target nodes with retry logic and circuit breaker pattern"""
-        successful_distributions = 0
+    async def register_node(self, node_id: str, node_info: dict) -> bool:
+        """Register a new node in the network"""
+        if node_id in self.nodes:
+            self.logger.warning(f'Node {node_id} already registered')
+            return False
 
-        for node in target_nodes:
-            if node not in self.nodes:
-                self.nodes[node] = CircuitBreaker()
-
-            circuit = self.nodes[node]
-            
-            if self._is_circuit_open(circuit):
-                self.logger.warning(f'Circuit breaker open for node {node}, skipping distribution')
-                continue
-
-            for attempt in range(retries):
-                try:
-                    success = self._send_to_node(node, content)
-                    if success:
-                        successful_distributions += 1
-                        circuit.failure_count = 0
-                        break
-                except Exception as e:
-                    self.logger.error(f'Distribution attempt {attempt + 1} failed for node {node}: {str(e)}')
-                    self._handle_failure(circuit)
-                    if attempt == retries - 1:
-                        self.logger.error(f'All retries failed for node {node}')
-
-        return successful_distributions > 0
-
-    def _is_circuit_open(self, circuit: CircuitBreaker) -> bool:
-        """Check if circuit breaker is open and handle state transitions"""
-        if circuit.state == CircuitState.OPEN:
-            if time.time() - circuit.last_failure_time >= circuit.reset_timeout:
-                circuit.state = CircuitState.HALF_OPEN
-                return False
-            return True
-        return False
-
-    def _handle_failure(self, circuit: CircuitBreaker):
-        """Handle node failure and update circuit breaker state"""
-        circuit.failure_count += 1
-        circuit.last_failure_time = time.time()
-
-        if circuit.failure_count >= circuit.failure_threshold:
-            circuit.state = CircuitState.OPEN
-            self.logger.warning('Circuit breaker triggered - opening circuit')
-
-    def _send_to_node(self, node: str, content: Dict[str, Any]) -> bool:
-        """Send content to a specific node"""
-        # TODO: Implement actual node communication logic
-        # This is a placeholder that should be replaced with real node communication
+        self.nodes[node_id] = node_info
+        self.active_nodes.add(node_id)
+        self.last_heartbeat[node_id] = time.time()
+        self.logger.info(f'Node {node_id} registered successfully')
         return True
 
-    def get_node_health(self) -> Dict[str, Dict]:
-        """Get health status of all nodes"""
+    async def deregister_node(self, node_id: str) -> bool:
+        """Remove a node from the network"""
+        if node_id not in self.nodes:
+            return False
+
+        del self.nodes[node_id]
+        self.active_nodes.discard(node_id)
+        self.last_heartbeat.pop(node_id, None)
+        self.logger.info(f'Node {node_id} deregistered')
+        return True
+
+    async def update_heartbeat(self, node_id: str) -> bool:
+        """Update last heartbeat time for a node"""
+        if node_id not in self.nodes:
+            return False
+
+        self.last_heartbeat[node_id] = time.time()
+        return True
+
+    async def check_node_health(self) -> None:
+        """Monitor node health and remove inactive nodes"""
+        while True:
+            current_time = time.time()
+            inactive_nodes = [
+                node_id for node_id in self.active_nodes
+                if current_time - self.last_heartbeat.get(node_id, 0) > self.node_timeout
+            ]
+
+            for node_id in inactive_nodes:
+                self.logger.warning(f'Node {node_id} timed out, removing from network')
+                await self.deregister_node(node_id)
+
+            await asyncio.sleep(self.heartbeat_interval)
+
+    async def get_network_status(self) -> dict:
+        """Get current network status and statistics"""
         return {
-            node: {
-                'state': cb.state.value,
-                'failures': cb.failure_count,
-                'last_failure': cb.last_failure_time
-            } for node, cb in self.nodes.items()
+            'total_nodes': len(self.nodes),
+            'active_nodes': len(self.active_nodes),
+            'nodes': self.nodes
         }
 
-    def reset_circuit(self, node: str) -> bool:
-        """Manually reset circuit breaker for a node"""
-        if node in self.nodes:
-            self.nodes[node] = CircuitBreaker()
-            return True
-        return False
+    async def get_healthy_nodes(self) -> Set[str]:
+        """Get set of currently healthy nodes"""
+        current_time = time.time()
+        return {
+            node_id for node_id in self.active_nodes
+            if current_time - self.last_heartbeat.get(node_id, 0) <= self.node_timeout
+        }
+
+    async def start(self) -> None:
+        """Start the orchestrator's background tasks"""
+        self.logger.info('Starting Network Orchestrator')
+        await self.check_node_health()
+
+    async def stop(self) -> None:
+        """Cleanup and shutdown orchestrator"""
+        self.logger.info('Stopping Network Orchestrator')
+        self.nodes.clear()
+        self.active_nodes.clear()
+        self.last_heartbeat.clear()
